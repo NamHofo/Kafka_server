@@ -73,7 +73,7 @@ def forward_messages(consumer: Consumer, producer: Producer):
         producer (Producer): Kafka producer instance.
     """
     logging.info("Bắt đầu đọc và forward dữ liệu...")
-    count = 0
+    
     try:
         while True:
             msg = consumer.poll(timeout=1.0)
@@ -117,10 +117,6 @@ def forward_messages(consumer: Consumer, producer: Producer):
             except Exception as e:
                 logging.error(f"Lỗi khi produce message: {e}, nội dung: {raw_value}")
                 continue
-            count += 1
-
-            if count > 100: 
-                return
 
     except KeyboardInterrupt:
         logging.info("Dừng chương trình theo yêu cầu người dùng.")
