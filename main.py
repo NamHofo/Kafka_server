@@ -1,7 +1,11 @@
 from confluent_kafka import Consumer, Producer
 import logging
-from config import source_config, target_config, source_topic, target_topic
 import json
+from pymongo import MongoClient
+from contextlib import closing
+
+from config import source_config, target_config, source_topic, target_topic, mongo_url, mongo_db, mongo_collection
+
 
 # Cấu hình logging
 logging.basicConfig(
@@ -33,7 +37,7 @@ def check_kafka_connection(conf, name="Kafka"):
         return False
 
 #Create consumer
-def create_consumer(conf, topic_name):
+def create_consumer(conf, topic_name : str):
     """
     Tạo Kafka Consumer và đăng ký topic.
     """
@@ -47,7 +51,7 @@ def create_consumer(conf, topic_name):
         return None
 
 # Create producer
-def create_producer(conf):
+def create_producer(conf : dict):
     """
     Tạo Kafka Producer.
     """
@@ -67,7 +71,6 @@ def forward_messages(consumer: Consumer, producer: Producer):
     Args:
         consumer (Consumer): Kafka consumer instance.
         producer (Producer): Kafka producer instance.
-        target_topic (str): Tên topic đích để gửi message.
     """
     logging.info("Bắt đầu đọc và forward dữ liệu...")
     count = 0
@@ -115,9 +118,9 @@ def forward_messages(consumer: Consumer, producer: Producer):
                 logging.error(f"Lỗi khi produce message: {e}, nội dung: {raw_value}")
                 continue
             count += 1
-            if (count >= 50000):
-                logging.info("Đã forward 50000 message, dừng lại để tránh quá tải.")
-                break
+
+            if count > 100: 
+                return
 
     except KeyboardInterrupt:
         logging.info("Dừng chương trình theo yêu cầu người dùng.")
@@ -129,7 +132,7 @@ def forward_messages(consumer: Consumer, producer: Producer):
         logging.info("Consumer và producer đã đóng kết nối.")
 
 # Preview messages from source for debugging
-def preview_messages_from_source(consumer, num_messages=5):
+def preview_messages_from_source(consumer, num_messages = 5):
     """
     In ra một vài message từ Kafka source để kiểm tra dữ liệu.
     """
@@ -150,9 +153,63 @@ def preview_messages_from_source(consumer, num_messages=5):
 
     except Exception as e:
         logging.error(f"Lỗi khi đọc dữ liệu từ Kafka nguồn: {e}")
-    finally:
-        consumer.close()
-        logging.info("Đã đóng kết nối Kafka consumer.")
+
+# Export messages from Kafka to MongoDB
+def export_to_mongo(collection, consumer, max_empty_polls = 5):
+    """
+    Xuất dữ liệu từ Kafka consumer sang MongoDB collection.
+    Args:
+        collection (pymongo.collection.Collection): MongoDB collection để lưu dữ liệu.
+        consumer (Consumer): Kafka consumer instance.
+        max_empty_polls (int): Số lần không nhận được message trước khi dừng.
+    """
+
+    if collection is None:
+        logging.error("Không thể kết nối tới MongoDB collection.")
+        return
+    logging.info("Kết nối tới MongoDB thành công.")
+
+    empty_poll_count = 0
+
+    while True:
+        try:
+            msg = consumer.poll(timeout=1.0)
+
+            if msg is None:
+                empty_poll_count += 1
+                logging.info(f"Không có message mới. Số lần không nhận được message: {empty_poll_count}")
+                if empty_poll_count >= max_empty_polls:
+                    logging.info(f"Không còn message sau {max_empty_polls} lần kiểm tra. Kết thúc.")
+                    break
+                continue
+            else:
+                empty_poll_count = 0  # Reset nếu có message
+
+            if msg.error():
+                logging.error(f"Lỗi message: {msg.error()}")
+                continue
+
+            try:
+                value = msg.value().decode('utf-8')
+
+                try:
+                    doc = json.loads(value)
+                except json.JSONDecodeError:
+                    doc = {"message": value}
+
+                result = collection.insert_one(doc)
+                logging.info(f"Đã lưu message với _id: {result.inserted_id}")
+
+            except Exception as e:
+                logging.error(f"Lỗi khi xử lý message: {e}, nội dung: {msg.value()}")
+
+        except KeyboardInterrupt:
+            logging.info("Dừng chương trình theo yêu cầu người dùng.")
+            break
+
+    consumer.close()
+    logging.info("Đã đóng Kafka consumer.")
+
 
 
 def main():
@@ -164,31 +221,41 @@ def main():
         logging.error("Không thể kết nối tới Kafka đích, dừng chương trình.")
         return
 
-    consumer = create_consumer(source_config, source_topic)
-    if consumer is None:
-        logging.error("Không thể tạo consumer, dừng chương trình.")
-        return
+    with closing(create_consumer(source_config, source_topic)) as source_consumer:
+        if source_consumer is None:
+            logging.error("Không thể tạo consumer cho nguồn.")
+            return
 
-    producer = create_producer(target_config)
-    if producer is None:
-        logging.error("Không thể tạo producer, dừng chương trình.")
-        consumer.close()
-        return
-    # Forward messages from source to target
-    # forward_messages(consumer, producer)
+        producer = create_producer(target_config)
+        if producer is None:
+            logging.error("Không thể tạo producer.")
+            return
 
-    # Preview messages from source for debugging
-    # preview_messages_from_source(consumer, num_messages=5)
+        forward_messages(source_consumer, producer)
 
-    # Read message from target topic
-    consumer = create_consumer(target_config, target_topic)
-    if consumer is None:
-        logging.error(f"Không thể tạo consumer cho topic đích '{target_topic}', dừng chương trình.")
-        return
-    if consumer is not None:
+    with closing(create_consumer(target_config, target_topic)) as preview_consumer:
+        if preview_consumer is None:
+            logging.error(f"Không thể tạo consumer cho topic đích '{target_topic}'.")
+            return
+
         logging.info(f"Đang đọc message từ topic đích '{target_topic}'...")
-        preview_messages_from_source(consumer, num_messages=5)
+        preview_messages_from_source(preview_consumer, num_messages=5)
 
+    try:
+        with MongoClient(mongo_url) as mongo_client:
+            db = mongo_client[mongo_db]
+            collection = db[mongo_collection]
+
+            with closing(create_consumer(target_config, target_topic)) as mongo_consumer:
+                if mongo_consumer is None:
+                    logging.error("Không thể tạo consumer để export dữ liệu sang MongoDB.")
+                    return
+
+                logging.info(f"Đang xuất dữ liệu từ topic '{target_topic}' sang MongoDB collection '{mongo_collection}'...")
+                export_to_mongo(collection, mongo_consumer)
+
+    except Exception as e:
+        logging.error(f"Lỗi khi kết nối hoặc xuất dữ liệu tới MongoDB: {e}")
 
 
 if __name__ == "__main__":
