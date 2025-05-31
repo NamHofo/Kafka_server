@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-
+# Check connection to  Kafka source and target
 def check_kafka_connection(conf, name="Kafka"):
     """
     Kiểm tra kết nối tới Kafka bằng cách tạo Producer và gửi test message.
@@ -32,35 +32,34 @@ def check_kafka_connection(conf, name="Kafka"):
         logging.error(f"Lỗi kết nối tới {name}: {e}")
         return False
 
-
-def create_consumer(conf):
+#Create consumer
+def create_consumer(conf, topic_name):
     """
     Tạo Kafka Consumer và đăng ký topic.
     """
     try:
         consumer = Consumer(conf)
-        consumer.subscribe([source_topic])
-        logging.info(f"Consumer đã subscribe topic '{source_topic}'")
+        consumer.subscribe([topic_name])
+        logging.info(f"Consumer subcribe successfully!")
         return consumer
     except Exception as e:
         logging.error(f"Lỗi tạo consumer: {e}")
         return None
 
-
+# Create producer
 def create_producer(conf):
     """
     Tạo Kafka Producer.
     """
     try:
         producer = Producer(conf)
-        logging.info("Producer Kafka đã tạo thành công.")
-        logging.info(f"Producer sẽ gửi message tới topic '{target_topic}'")
+        logging.info("Producer created successfully!")
         return producer
     except Exception as e:
         logging.error(f"Lỗi tạo producer: {e}")
         return None
 
-
+# Forward messages from source to target
 def forward_messages(consumer: Consumer, producer: Producer):
     """
     Đọc message từ consumer và produce lại sang producer.
@@ -129,7 +128,7 @@ def forward_messages(consumer: Consumer, producer: Producer):
         consumer.close()
         logging.info("Consumer và producer đã đóng kết nối.")
 
-
+# Preview messages from source for debugging
 def preview_messages_from_source(consumer, num_messages=5):
     """
     In ra một vài message từ Kafka source để kiểm tra dữ liệu.
@@ -165,7 +164,7 @@ def main():
         logging.error("Không thể kết nối tới Kafka đích, dừng chương trình.")
         return
 
-    consumer = create_consumer(source_config)
+    consumer = create_consumer(source_config, source_topic)
     if consumer is None:
         logging.error("Không thể tạo consumer, dừng chương trình.")
         return
@@ -175,11 +174,21 @@ def main():
         logging.error("Không thể tạo producer, dừng chương trình.")
         consumer.close()
         return
+    # Forward messages from source to target
+    # forward_messages(consumer, producer)
 
-    forward_messages(consumer, producer)
-
-    # Check nội dung có trong source kafka
+    # Preview messages from source for debugging
     # preview_messages_from_source(consumer, num_messages=5)
+
+    # Read message from target topic
+    consumer = create_consumer(target_config, target_topic)
+    if consumer is None:
+        logging.error(f"Không thể tạo consumer cho topic đích '{target_topic}', dừng chương trình.")
+        return
+    if consumer is not None:
+        logging.info(f"Đang đọc message từ topic đích '{target_topic}'...")
+        preview_messages_from_source(consumer, num_messages=5)
+
 
 
 if __name__ == "__main__":
