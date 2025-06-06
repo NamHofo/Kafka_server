@@ -3,6 +3,7 @@ import logging
 import json
 from pymongo import MongoClient
 from contextlib import closing
+import threading
 
 from config import source_config, target_config, source_topic, target_topic, mongo_url, mongo_db, mongo_collection
 
@@ -165,21 +166,9 @@ def export_to_mongo(collection, consumer, max_empty_polls = 5):
         return
     logging.info("Kết nối tới MongoDB thành công.")
 
-    empty_poll_count = 0
-
     while True:
         try:
             msg = consumer.poll(timeout=1.0)
-
-            if msg is None:
-                empty_poll_count += 1
-                logging.info(f"Không có message mới. Số lần không nhận được message: {empty_poll_count}")
-                if empty_poll_count >= max_empty_polls:
-                    logging.info(f"Không còn message sau {max_empty_polls} lần kiểm tra. Kết thúc.")
-                    break
-                continue
-            else:
-                empty_poll_count = 0  # Reset nếu có message
 
             if msg.error():
                 logging.error(f"Lỗi message: {msg.error()}")
@@ -217,42 +206,55 @@ def main():
         logging.error("Không thể kết nối tới Kafka đích, dừng chương trình.")
         return
 
-    with closing(create_consumer(source_config, source_topic)) as source_consumer:
-        if source_consumer is None:
-            logging.error("Không thể tạo consumer cho nguồn.")
-            return
+    producer = create_consumer(target_config)
+    source_consumer = create_consumer(source_config, source_topic)
 
-        producer = create_producer(target_config)
-        if producer is None:
-            logging.error("Không thể tạo producer.")
-            return
+    if producer is None or source_consumer is None:
+        logging.error("Không thể tạo producer hoặc consumer cho forwarding.")
+        return
 
-        forward_messages(source_consumer, producer)
-
-    with closing(create_consumer(target_config, target_topic)) as preview_consumer:
-        if preview_consumer is None:
-            logging.error(f"Không thể tạo consumer cho topic đích '{target_topic}'.")
-            return
-
-        logging.info(f"Đang đọc message từ topic đích '{target_topic}'...")
-        preview_messages_from_source(preview_consumer, num_messages=5)
+    # Tạo consumer riêng cho export_to_mongo
+    mongo_consumer = create_consumer(target_config, target_topic)
+    if mongo_consumer is None:
+        logging.error("Không thể tạo consumer cho MongoDB export.")
+        return
 
     try:
-        with MongoClient(mongo_url) as mongo_client:
-            db = mongo_client[mongo_db]
-            collection = db[mongo_collection]
-
-            with closing(create_consumer(target_config, target_topic)) as mongo_consumer:
-                if mongo_consumer is None:
-                    logging.error("Không thể tạo consumer để export dữ liệu sang MongoDB.")
-                    return
-
-                logging.info(f"Đang xuất dữ liệu từ topic '{target_topic}' sang MongoDB collection '{mongo_collection}'...")
-                export_to_mongo(collection, mongo_consumer)
-
+        mongo_client = MongoClient(mongo_url)
+        db = mongo_client[mongo_db]
+        collection = db[mongo_collection]
     except Exception as e:
-        logging.error(f"Lỗi khi kết nối hoặc xuất dữ liệu tới MongoDB: {e}")
+        logging.error(f"Lỗi khi kết nối MongoDB: {e}")
+        return
 
+    # Thread 1: Forward messages từ source đến target
+    forward_thread = threading.Thread(
+        target=forward_messages,
+        args=(source_consumer, producer),
+        name="ForwardThread"
+    )
+
+    # Thread 2: Export từ target topic sang MongoDB
+    export_thread = threading.Thread(
+        target=export_to_mongo,
+        args=(collection, mongo_consumer),
+        name="ExportMongoThread"
+    )
+
+    logging.info("Bắt đầu chạy song song forwarding và export to MongoDB.")
+    forward_thread.start()
+    export_thread.start()
+
+    try:
+        forward_thread.join()
+        export_thread.join()
+    except KeyboardInterrupt:
+        logging.info("Người dùng yêu cầu dừng chương trình.")
+    finally:
+        source_consumer.close()
+        mongo_consumer.close()
+        mongo_client.close()
+        logging.info("Đã đóng kết nối Kafka và MongoDB.")
 
 if __name__ == "__main__":
     main()
